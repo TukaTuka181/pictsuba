@@ -6,12 +6,12 @@ from docx.table import Table as DocxTable
 import json
 import re
 import base64
-from PIL import Image
-import numpy as np
-import io
 
 def normalize(text: str) -> str:
     return re.sub(r'\s+', '', text).strip()
+
+
+# --- 画像処理の関数群 ---
 
 def has_inline_image(para) -> bool:
     """段落内に行内画像が含まれるか判定"""
@@ -19,20 +19,37 @@ def has_inline_image(para) -> bool:
       return True
     return False
 
+def paragraph_to_dict(para, page_no, image_no, doc) -> dict:
+    """段落を構造化して辞書で返す"""
+    data = {
+        "type": "image",
+        "page_no": page_no,
+        "image_no": image_no,
+        "data_url": None,
+        "paragraph_style": para.style.name if para.style else None,
+        "alignment": para.alignment
+    }
+
+    for drawing in para._element.findall('.//' + qn('w:drawing')):
+        blip = drawing.find('.//' + qn('a:blip'))
+        if blip is None:
+            continue
+        r_id = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+        if not r_id:
+            continue
+        image_part = doc.part.related_parts.get(r_id)
+        if image_part is None:
+            continue
+        base64_str = base64.b64encode(image_part.blob).decode("utf-8")
+        data["data_url"] = base64_str
+
+    return data
+
 def extract_images_from_para(para, doc) -> list:
     """段落内の画像をbase64に変換して返す"""
     images = []
 
     for drawing in para._element.findall('.//' + qn('w:drawing')):
-
-        # 画像サイズの取得（EMU → cm変換）
-        extent = drawing.find('.//' + qn('wp:extent'))
-        width_cm  = round(int(extent.get('cx', 0)) / 360000, 2) if extent is not None else None
-        height_cm = round(int(extent.get('cy', 0)) / 360000, 2) if extent is not None else None
-
-        # altテキストの取得
-        docPr = drawing.find('.//' + qn('wp:docPr'))
-        alt_text = docPr.get('descr', None) if docPr is not None else None
 
         # rIdの取得（画像ファイルへの参照ID）
         blip = drawing.find('.//' + qn('a:blip'))
@@ -104,33 +121,44 @@ for child in doc.element.body.iterchildren():
     if child.tag == qn('w:p'):
         para = DocxParagraph(child, doc)
 
+        pPr = para._element.pPr
+        if pPr is not None and pPr.sectPr is not None:
+            results.append({
+                "type": "section_break",
+                "paragraph_no": paragraph_no,
+                "text": ""
+            })
+            paragraph_no += 1
+            continue
+
 
         # 画像を含む段落の処理
         if has_inline_image(para):
-          
+
             # 前のresultからページ番号を推定
             find_result = next(
                 (r for r in reversed(results) if r.get("page_no")),
                 None
             )
-            prev_page_no = find_result["page_no"]
-            if "".join(find_result["text"]) == pdf_pages[prev_page_no - 1]["last_word"]:
-              print("next_page")
-              prev_page_no += 1
 
 
-            base64_str = extract_images_from_para(para, doc)
-            results.append({
-                "type": "image",
-                "page_no": prev_page_no,
-                "paragraph_no": image_no,
-                "text": base64_str
-            })  
+            if not find_result:
+                prev_page_no = None
+            else:
+                prev_page_no = find_result["page_no"]
 
+                if find_result and "".join(find_result.get("text", "")) == pdf_pages[prev_page_no - 1]["last_word"]:
+                    prev_page_no = None
+
+            paragraph_data = paragraph_to_dict(para,prev_page_no, image_no, doc)
+
+            results.append(paragraph_data)
             image_no += 1
 
         # runごとにテキストを取得して結合 & ページ番号を探す
         full_text = para.text.strip()
+
+        
         if not full_text:
             continue
 
@@ -138,7 +166,6 @@ for child in doc.element.body.iterchildren():
         run_text = ""
         page_no = None
         for run in para.runs:
-            print(f"==run_text:{run.text}==")
             run_text += run.text
             candidate = normalize(run_text)
             if candidate:
@@ -165,8 +192,7 @@ for child in doc.element.body.iterchildren():
             for col_no, cell in enumerate(row.cells):
                 cell_text = cell.text.strip()
                 row_data.append(cell_text)
-            
-            print(f"==cell:{" ".join(row_data)}==")
+
             result = find_page_no(" ".join(row_data))
             if result:
                 table_page_no = result
@@ -180,14 +206,23 @@ for child in doc.element.body.iterchildren():
                 "text": row_data
             })
         table_no += 1
-    
+
 for i, item in enumerate(results):
     if item["type"] == "image" and item["page_no"] is None:
-        # 後続の要素からも探す
-        next_page = next(
+        # 文章の最後に画像がある場合、前のページ番号を引き継ぐ
+        if not results[i+1:]:
+            find_result = next(
+                (r for r in reversed(results) if r.get("page_no")),
+                None
+            )
+            prev_page_no = find_result["page_no"]
+            item["page_no"] = prev_page_no
+            continue    
+        
+        prev_page_no = next(
             (r["page_no"] for r in results[i+1:] if r.get("page_no")),
             None
         )
-        item["page_no"] = next_page
+        item["page_no"] = prev_page_no
 
 print(json.dumps(results, ensure_ascii=False, indent=2))
